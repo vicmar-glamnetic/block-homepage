@@ -3,10 +3,11 @@
 
   Visitors from the listed countries ('PK', 'EG', 'MA', 'IL', 'LB', 'YE', 'OM', 'IN', 'GB') see the ADJUSTED homepage (#MaintenanceHome). Every other country sees the store as usual. All non-homepage templates always render normally for everyone.
 
-  Country is resolved via a CHAIN of keyless geo providers
-  (country.is -> geojs -> ipapi -> ipwho.is); the first that answers wins, so one
-  being rate-limited or down doesn't break the gate. Result is cached per-visitor
-  for 24h so we don't hammer any provider.
+  Country is resolved by querying ALL keyless geo providers IN PARALLEL
+  (country.is, geojs, ipapi, ipwho.is); the first valid answer wins. Parallel,
+  not sequential — a slow or rate-limited provider can no longer hold up the
+  verdict, so the lookup typically finishes in a few hundred ms even over a VPN.
+  Result is cached per-visitor for 24h so we don't hammer any provider.
 
   FAIL OPEN: if ALL providers fail we cannot prove the visitor is in a blocked
   country, so the store shows as usual. Flip SHOW_STORE_IF_UNKNOWN to false to
@@ -19,8 +20,13 @@
   first paint) so a blocked visitor never sees a flash of the store while the
   async geo lookup runs. Because most traffic is now ALLOWED, the overlay is
   skipped entirely for returning visitors whose cached country is not blocked.
-  A 2s failsafe removes the overlay if the lookup stalls, so the page is never
-  left blank.
+
+  FAILSAFE: after FAILSAFE_MS with no verdict, the overlay is removed so the page
+  is never left blank. IMPORTANT — the failsafe only ever REVEALS; it never
+  cancels the gate. If a "blocked" verdict arrives after the failsafe already
+  revealed the store, the adjusted homepage is still applied. Blocking correctly
+  matters more than avoiding a rare late flicker, and the parallel lookup makes
+  that case very unlikely in the first place.
 {%- endcomment -%}
 <script>
   window.isHomePage = {{ request.page_type | json }} === 'index';
@@ -33,12 +39,19 @@
   var SHOW_STORE_IF_UNKNOWN = true;
 
   // Paid Google Ads clicks always see the store, even from a blocked country.
-  // Set to false if the block is for fraud / shipping reasons, since ad clicks
-  // from blocked countries currently slip straight past the gate.
   var PAID_ADS_BYPASS = true;
 
-  var GEO_KEY    = 'geoCountry';
-  var GEO_TTL_MS = 24 * 60 * 60 * 1000; // re-check at most once per day
+  var GEO_KEY             = 'geoCountry';
+  var GEO_TTL_MS          = 24 * 60 * 60 * 1000; // re-check at most once per day
+  var PROVIDER_TIMEOUT_MS = 5000;                // generous — providers run in PARALLEL, so a slow one costs nothing
+  var FAILSAFE_MS         = 4000;                // max time the overlay may sit there with no verdict
+
+  // Set only by the paid-ads bypass: a hard stop that prevents the gate from
+  // ever closing on a paid visitor. NOT used to cancel a late blocked verdict.
+  var adsBypass = false;
+
+  // True once the store has been revealed, so we never double-reveal.
+  var storeRevealed = false;
 
   function getCachedCountry() {
     try {
@@ -55,6 +68,48 @@
     return BLOCKED.indexOf(cc) !== -1;
   }
 
+  // Remove the anti-flicker overlay (reveals the store underneath).
+  function removeFlicker() {
+    var g = document.getElementById('geoFlicker');
+    if (g && g.parentNode) g.parentNode.removeChild(g);
+  }
+
+  function forceFont(root) {
+    if (!root) return;
+    var font = 'system-ui, sans-serif';
+    root.style.setProperty('font-family', font, 'important');
+    root.querySelectorAll('*').forEach(function (node) {
+      node.style.setProperty('font-family', font, 'important');
+    });
+  }
+
+  // Blocked visitors: cover the store with the full-screen adjusted homepage.
+  // Top-level (not inside DOMContentLoaded) so the failsafe and the lookup —
+  // which can fire on either side of DOMContentLoaded — call the same function.
+  function showMaintenance() {
+    var maintenance = document.getElementById('MaintenanceHome');
+    var baseCss     = document.getElementById('baseCss');
+    if (maintenance) {
+      maintenance.style.setProperty('display', 'block', 'important');
+      maintenance.style.setProperty('position', 'fixed', 'important');
+      maintenance.style.setProperty('inset', '0', 'important');
+      maintenance.style.setProperty('z-index', '2147483000', 'important');
+      maintenance.style.setProperty('background', '#ffffff', 'important');
+      maintenance.style.setProperty('overflow', 'auto', 'important');
+    }
+    document.documentElement.style.setProperty('overflow', 'hidden', 'important');
+    if (document.body) document.body.style.setProperty('overflow', 'hidden', 'important');
+    if (baseCss) baseCss.disabled = true;
+    forceFont(maintenance);
+    removeFlicker();
+  }
+
+  function revealStore() {
+    if (storeRevealed) return;
+    storeRevealed = true;
+    removeFlicker();
+  }
+
   // Anti-flicker overlay — painted before first paint, covers the store during
   // the geo lookup. This is a COVER on top, NOT visibility:hidden, so the store
   // renders/initializes normally underneath and nothing breaks. Skipped for
@@ -64,25 +119,27 @@
     if (!cachedCc || isBlockedCountry(cachedCc)) {
       var geoFlicker = document.createElement('div');
       geoFlicker.id = 'geoFlicker';
-      geoFlicker.setAttribute('style', 'position:fixed;inset:0;z-index:2147483001;background:#ffffff;');
+      geoFlicker.setAttribute(
+        'style',
+        'position:fixed !important;inset:0 !important;top:0 !important;left:0 !important;' +
+        'right:0 !important;bottom:0 !important;width:100% !important;height:100% !important;' +
+        'z-index:2147483647 !important;background:#ffffff !important;opacity:1 !important;' +
+        'visibility:visible !important;'
+      );
       (document.body || document.documentElement).appendChild(geoFlicker);
-      // Failsafe: never leave the page blank if the geo lookup stalls.
+
+      // Failsafe: never leave the page blank if the lookup stalls. This only
+      // REVEALS — it never cancels the gate, so a blocked verdict arriving
+      // afterwards still applies the adjusted homepage.
       setTimeout(function () {
-        var g = document.getElementById('geoFlicker');
-        if (g && g.parentNode) g.parentNode.removeChild(g);
-      }, 2000);
+        if (SHOW_STORE_IF_UNKNOWN) { revealStore(); }
+        else { showMaintenance(); }
+      }, FAILSAFE_MS);
     }
   }
 
   document.addEventListener('DOMContentLoaded', function () {
     var maintenance = document.getElementById('MaintenanceHome');
-    var baseCss     = document.getElementById('baseCss');
-
-    // Remove the anti-flicker overlay (reveals the store underneath).
-    function removeFlicker() {
-      var g = document.getElementById('geoFlicker');
-      if (g && g.parentNode) g.parentNode.removeChild(g);
-    }
 
     // FIX (add-to-cart): UpCart's cart-drawer app block is rendered inside the
     // maintenance snippet, i.e. inside #MaintenanceHome, which is display:none.
@@ -104,15 +161,6 @@
       }
     } catch (e) {}
 
-    function forceFont(root) {
-      if (!root) return;
-      var font = 'system-ui, sans-serif';
-      root.style.setProperty('font-family', font, 'important');
-      root.querySelectorAll('*').forEach(function (node) {
-        node.style.setProperty('font-family', font, 'important');
-      });
-    }
-
     // Safety net: eagerly arm the homepage quick-add buttons in case any remain
     // in Impulse's "--not-ready" state. Idempotent — only touches not-ready
     // buttons — and harmless if the theme already armed them itself.
@@ -127,23 +175,6 @@
           try { theme.preloadProductModal(handle, id, btn); } catch (e) {}
         }
       });
-    }
-
-    // Blocked visitors: cover the store with the full-screen adjusted homepage.
-    function showMaintenance() {
-      if (maintenance) {
-        maintenance.style.setProperty('display', 'block', 'important');
-        maintenance.style.setProperty('position', 'fixed', 'important');
-        maintenance.style.setProperty('inset', '0', 'important');
-        maintenance.style.setProperty('z-index', '2147483000', 'important');
-        maintenance.style.setProperty('background', '#ffffff', 'important');
-        maintenance.style.setProperty('overflow', 'auto', 'important');
-      }
-      document.documentElement.style.setProperty('overflow', 'hidden', 'important');
-      document.body.style.setProperty('overflow', 'hidden', 'important');
-      if (baseCss) baseCss.disabled = true;
-      forceFont(maintenance);
-      removeFlicker();
     }
 
     // Paid Google Ads gate. Google Ads appends a click-id param on paid clicks:
@@ -169,8 +200,10 @@
       return false;
     }
 
-    // --- Geo detection: multi-provider chain + 24h cache ----------------------
-    // Keyless, CORS-friendly providers tried in order. First valid answer wins.
+    // --- Geo detection: parallel provider race + 24h cache --------------------
+    // Keyless, CORS-friendly providers. ALL are queried at once and the first
+    // valid answer wins, so the verdict arrives as fast as the fastest provider
+    // instead of waiting out a chain of slow ones.
     var GEO_PROVIDERS = [
       { url: 'https://api.country.is/',                 parse: function (d) { return d && d.country; } },
       { url: 'https://get.geojs.io/v1/ip/country.json', parse: function (d) { return d && d.country; } },
@@ -178,21 +211,38 @@
       { url: 'https://ipwho.is/',                       parse: function (d) { return d && d.success !== false && d.country_code; } }
     ];
 
-    // Walk the provider chain; resolve '' only if every provider fails.
+    function fetchWithTimeout(url, ms) {
+      var controller = new AbortController();
+      var timer = setTimeout(function () { controller.abort(); }, ms);
+      return fetch(url, { signal: controller.signal }).then(
+        function (r) { clearTimeout(timer); return r; },
+        function (e) { clearTimeout(timer); throw e; }
+      );
+    }
+
+    // Resolve with the first provider that returns a country code; resolve ''
+    // only once every provider has failed.
     function lookupCountry() {
-      var i = 0;
-      function tryNext() {
-        if (i >= GEO_PROVIDERS.length) return Promise.resolve('');
-        var p = GEO_PROVIDERS[i++];
-        return fetch(p.url)
-          .then(function (r) { return r.json(); })
-          .then(function (d) {
-            var cc = p.parse(d);
-            return cc ? String(cc).toUpperCase() : tryNext();
-          })
-          .catch(function () { return tryNext(); });
-      }
-      return tryNext();
+      return new Promise(function (resolve) {
+        var pending = GEO_PROVIDERS.length;
+        var done = false;
+        function finish(cc) {
+          if (done) return;
+          done = true;
+          resolve(cc || '');
+        }
+        GEO_PROVIDERS.forEach(function (p) {
+          fetchWithTimeout(p.url, PROVIDER_TIMEOUT_MS)
+            .then(function (r) { return r.json(); })
+            .then(function (d) { return p.parse(d); })
+            .catch(function () { return null; })
+            .then(function (cc) {
+              if (cc) { finish(String(cc).toUpperCase()); return; }
+              pending--;
+              if (pending === 0) finish('');
+            });
+        });
+      });
     }
 
     function detectCountryViaIP() {
@@ -211,21 +261,28 @@
     if (!window.isHomePage) { return; }
 
     // Homepage + paid Google Ads click: keep the store and reveal.
-    if (paidAds) { armQuickShop(); removeFlicker(); return; }
+    if (paidAds) {
+      adsBypass = true; // hard stop — the gate must never close on a paid visitor
+      armQuickShop();
+      revealStore();
+      return;
+    }
 
     // Otherwise the IP decides. Blocked countries get the adjusted homepage;
-    // everyone else keeps the fully-working store.
+    // everyone else keeps the fully-working store. A blocked verdict is applied
+    // even if the failsafe already revealed the store — the gate always wins.
     detectCountryViaIP().then(function (cc) {
+      if (adsBypass) return;
       if (isBlockedCountry(cc)) { showMaintenance(); }
-      else { armQuickShop(); removeFlicker(); }
+      else { armQuickShop(); revealStore(); }
     });
   });
 
   console.log({
-  snippetLoaded: typeof window.isHomePage !== 'undefined',
-  isHomePage: window.isHomePage,
-  maintenanceEl: !!document.getElementById('MaintenanceHome'),
-  cachedGeo: localStorage.getItem('geoCountry'),
-  paidAds: localStorage.getItem('paidAdsVisit')
-});
+    snippetLoaded: typeof window.isHomePage !== 'undefined',
+    isHomePage: window.isHomePage,
+    maintenanceEl: !!document.getElementById('MaintenanceHome'),
+    cachedGeo: localStorage.getItem('geoCountry'),
+    paidAds: localStorage.getItem('paidAdsVisit')
+  });
 </script>
