@@ -1,0 +1,36 @@
+
+<div id="MaintenanceHome">
+  <picture class="maintenance-picture">
+    <!-- Mobile image shows at 767px and below -->
+    <source media="(max-width: 767px)" srcset="https://cdn.shopify.com/s/files/1/1067/5814/4330/files/3.jpg?v=1786448145">
+    <!-- Desktop image (default) -->
+    <img src="https://cdn.shopify.com/s/files/1/1067/5814/4330/files/4.jpg?v=1786448145" alt="" class="maintenance-image">
+  </picture>
+</div>
+
+<style>
+  #MaintenanceHome {
+    position: fixed;
+    inset: 0;                 /* top:0 right:0 bottom:0 left:0 */
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;           /* dynamic viewport height — accounts for mobile address bar */
+    z-index: 999999999999;
+    background: #ffffff;
+    overflow: hidden;
+  }
+  /* The <picture> element is inline by default, so it must be made a full-size
+     block for the image's 100% height to resolve correctly. */
+  #MaintenanceHome .maintenance-picture {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  #MaintenanceHome .maintenance-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;        /* fills screen, crops overflow. Use "contain" to show whole image with no crop */
+    object-position: center;  /* keep the middle of the image in view when cropping */
+    display: block;
+  }
+</style>
