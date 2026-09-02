@@ -5,37 +5,34 @@
 
   Country is resolved by querying ALL keyless geo providers IN PARALLEL
   (country.is, geojs, ipapi, ipwho.is); the first valid answer wins, so a slow or
-  rate-limited provider can't hold up the verdict. Result is cached per-visitor
-  for 24h, so a returning blocked visitor is gated instantly with no lookup.
+  rate-limited provider can't hold up the verdict.
+
+  TIMING — the lookup starts IMMEDIATELY, here in <head>. It used to be started
+  inside the DOMContentLoaded handler, which on a heavy storefront does not fire
+  until ~7s; the 4s failsafe then gave up and revealed the store before the
+  verdict had even been requested. The lookup needs no DOM, so it now fires at
+  ~0ms and the verdict is normally in hand within a few hundred ms — long before
+  any failsafe.
 
   FAIL OPEN: if ALL providers fail we cannot prove the visitor is in a blocked
   country, so the store shows as usual. Flip SHOW_STORE_IF_UNKNOWN to false to
   fail closed instead (unknown -> adjusted homepage). Do NOT trust Liquid's
   country: it defaults to the store's primary market and is unreliable.
 
-  ANTI-FLICKER — WHITE HOLDING SCREEN (CSS class, not a JS-inserted overlay):
-  the previous version appended a white <div> from JS while the page was still
-  in <head>. That div is subject to DOM-insertion timing and lost the race with
-  the parser, letting the real homepage paint for ~0.5s before it covered.
-  Instead we now add a class to <html> synchronously in <head> and let a <style>
-  block that is already parsed do the hiding. CSS is applied at first paint, so
-  there is no window in which the store can appear.
+  ANTI-FLICKER — WHITE HOLDING SCREEN: an html::before pseudo-element painted by
+  an injected stylesheet. Not a JS-inserted <div> (loses the race with the
+  parser), not visibility:hidden on <body> (visibility is inherited, so sticky
+  headers and app blocks that set visibility:visible paint straight through it),
+  and not toggled by a class on <html> (themes reassign className wholesale and
+  silently wipe it). The style element's PRESENCE is the hold; removing it
+  reveals. It sits on top of the store rather than hiding it, so layout and JS
+  init are untouched and quick-add / UpCart still measure correctly.
 
-  We use visibility, NOT display:none — the store still lays out and initializes
-  exactly like a normal store (quick-add, add to cart, UpCart all measure
-  correctly), it just isn't painted. Only the homepage is ever held; all other
-  templates render normally for everyone.
-
-  FAILSAFE: after FAILSAFE_MS with no verdict the page is revealed, so it is
-  never left white. The failsafe only ever REVEALS — it never cancels the gate,
-  so a blocked verdict arriving later still applies the adjusted homepage.
+  FAILSAFE: after FAILSAFE_MS with no verdict the page is revealed so it is never
+  left white. It only fires while the verdict is genuinely outstanding — a
+  blocked verdict that is waiting on the DOM does NOT trip it, and a blocked
+  verdict arriving after it still applies the adjusted homepage.
 {%- endcomment -%}
-<style>
-  /* White holding screen while the geo verdict is pending. Only active while
-     the .geo-checking class is on <html>, which JS adds and removes. */
-  html.geo-checking { background: #ffffff !important; }
-  html.geo-checking body { visibility: hidden !important; }
-</style>
 <script>
   window.isHomePage = {{ request.page_type | json }} === 'index';
 
@@ -49,39 +46,42 @@
   // Paid Google Ads clicks always see the store, even from a blocked country.
   var PAID_ADS_BYPASS = true;
 
+  // Cache the resolved country in localStorage for 24h?
+  //   false = always do a live lookup (country always current, ~300ms per load)
+  //   true  = returning visitors are gated instantly with no network call
+  var USE_GEO_CACHE = false;
+
   var GEO_KEY             = 'geoCountry';
   var GEO_TTL_MS          = 24 * 60 * 60 * 1000; // re-check at most once per day
-  var PROVIDER_TIMEOUT_MS = 5000;                // generous — providers run in PARALLEL, so a slow one costs nothing
-  var FAILSAFE_MS         = 4000;                // max time the page may be held white with no verdict
-  var GEO_CLASS           = 'geo-checking';
+  var PROVIDER_TIMEOUT_MS = 5000;                // generous — providers run in PARALLEL
+  var FAILSAFE_MS         = 6000;                // max white time while the verdict is outstanding
+  var HOLD_STYLE_ID       = 'geoHoldStyle';
 
-  // Set only by the paid-ads bypass: a hard stop so the gate never closes on a
-  // paid visitor. NOT used to cancel a late blocked verdict.
-  var adsBypass = false;
+  var adsBypass     = false; // paid-ads hard stop: the gate must never close on a paid click
+  var storeRevealed = false; // guards against double-reveal
+  var verdictIn     = false; // true once the country is known (or known-unknown)
 
-  // True once the store has been revealed, so we never double-reveal.
-  var storeRevealed = false;
-
-  function getCachedCountry() {
-    try {
-      var o = JSON.parse(localStorage.getItem(GEO_KEY));
-      if (o && o.cc && (Date.now() - o.ts) < GEO_TTL_MS) return o.cc;
-    } catch (e) {}
-    return null;
+  // --- White holding screen --------------------------------------------------
+  function holdPage() {
+    if (document.getElementById(HOLD_STYLE_ID)) return;
+    var s = document.createElement('style');
+    s.id = HOLD_STYLE_ID;
+    s.textContent =
+      'html::before{' +
+        'content:"" !important;' +
+        'position:fixed !important;' +
+        'top:0 !important;left:0 !important;right:0 !important;bottom:0 !important;' +
+        'width:100% !important;height:100% !important;' +
+        'background:#ffffff !important;' +
+        'z-index:2147483647 !important;' +
+        'pointer-events:auto !important;' +
+      '}';
+    (document.head || document.documentElement).appendChild(s);
   }
-  function setCachedCountry(cc) {
-    try { localStorage.setItem(GEO_KEY, JSON.stringify({ cc: cc, ts: Date.now() })); } catch (e) {}
-  }
-  function isBlockedCountry(cc) {
-    if (!cc) return !SHOW_STORE_IF_UNKNOWN; // unknown country
-    return BLOCKED.indexOf(cc) !== -1;
-  }
 
-  // Drop the white holding screen.
   function unhide() {
-    var de = document.documentElement;
-    if (de.classList) de.classList.remove(GEO_CLASS);
-    else de.className = de.className.replace(GEO_CLASS, '');
+    var s = document.getElementById(HOLD_STYLE_ID);
+    if (s && s.parentNode) s.parentNode.removeChild(s);
   }
 
   function revealStore() {
@@ -90,6 +90,131 @@
     unhide();
   }
 
+  // Run fn now if the DOM is ready, otherwise as soon as it is.
+  function onReady(fn) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', fn);
+    } else {
+      fn();
+    }
+  }
+
+  // Run fn as soon as #MaintenanceHome exists, WITHOUT waiting for
+  // DOMContentLoaded. On a heavy storefront DCL can be 7s away, but the element
+  // is parsed early in <body> — watching for it cuts the white hold from
+  // seconds to milliseconds. Falls back to DOMContentLoaded either way.
+  function whenMaintenanceExists(fn) {
+    var ran = false;
+    function go() {
+      if (ran) return;
+      ran = true;
+      if (mo) { try { mo.disconnect(); } catch (e) {} }
+      fn();
+    }
+    var mo = null;
+    if (document.getElementById('MaintenanceHome')) { go(); return; }
+    try {
+      mo = new MutationObserver(function () {
+        if (document.getElementById('MaintenanceHome')) go();
+      });
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {}
+    onReady(go); // backstop: fire at DCL even if the element never appears
+  }
+
+  // --- Country helpers -------------------------------------------------------
+  function getCachedCountry() {
+    if (!USE_GEO_CACHE) return null;
+    try {
+      var o = JSON.parse(localStorage.getItem(GEO_KEY));
+      if (o && o.cc && (Date.now() - o.ts) < GEO_TTL_MS) return o.cc;
+    } catch (e) {}
+    return null;
+  }
+  function setCachedCountry(cc) {
+    if (!USE_GEO_CACHE) return;
+    try { localStorage.setItem(GEO_KEY, JSON.stringify({ cc: cc, ts: Date.now() })); } catch (e) {}
+  }
+  function isBlockedCountry(cc) {
+    if (!cc) return !SHOW_STORE_IF_UNKNOWN; // unknown country
+    return BLOCKED.indexOf(cc) !== -1;
+  }
+
+  // --- Geo detection: parallel provider race ---------------------------------
+  var GEO_PROVIDERS = [
+    { url: 'https://api.country.is/',                 parse: function (d) { return d && d.country; } },
+    { url: 'https://get.geojs.io/v1/ip/country.json', parse: function (d) { return d && d.country; } },
+    { url: 'https://ipapi.co/json/',                  parse: function (d) { return d && d.country_code; } },
+    { url: 'https://ipwho.is/',                       parse: function (d) { return d && d.success !== false && d.country_code; } }
+  ];
+
+  function fetchWithTimeout(url, ms) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, ms);
+    return fetch(url, { signal: controller.signal }).then(
+      function (r) { clearTimeout(timer); return r; },
+      function (e) { clearTimeout(timer); throw e; }
+    );
+  }
+
+  // First provider to return a country code wins; '' only if all of them fail.
+  function lookupCountry() {
+    return new Promise(function (resolve) {
+      var pending = GEO_PROVIDERS.length;
+      var done = false;
+      function finish(cc) {
+        if (done) return;
+        done = true;
+        resolve(cc || '');
+      }
+      GEO_PROVIDERS.forEach(function (p) {
+        fetchWithTimeout(p.url, PROVIDER_TIMEOUT_MS)
+          .then(function (r) { return r.json(); })
+          .then(function (d) { return p.parse(d); })
+          .catch(function () { return null; })
+          .then(function (cc) {
+            if (cc) { finish(String(cc).toUpperCase()); return; }
+            pending--;
+            if (pending === 0) finish('');
+          });
+      });
+    });
+  }
+
+  function detectCountryViaIP() {
+    var cached = getCachedCountry();
+    if (cached) return Promise.resolve(cached);
+    return lookupCountry().then(function (cc) {
+      if (cc) setCachedCountry(cc); // never cache a failed ''
+      return cc;
+    });
+  }
+
+  // --- Paid Google Ads bypass ------------------------------------------------
+  // Google Ads appends a click-id on paid clicks: gclid (Search/Shopping),
+  // gbraid / wbraid (iOS app/web), gad_source. Captured on ANY page and
+  // persisted so a later homepage visit bypasses the IP gate.
+  var PAID_ADS_KEY       = 'paidAdsVisit';
+  var PAID_ADS_WINDOW_MS = 30 * 60 * 1000; // 30-minute attribution window
+
+  function urlHasPaidAdsParam() {
+    return /[?&](gclid|gbraid|wbraid|gad_source)=/i.test(window.location.search);
+  }
+  function hasPaidAdsVisit() {
+    try {
+      if (urlHasPaidAdsParam()) {
+        localStorage.setItem(PAID_ADS_KEY, String(Date.now()));
+        return true;
+      }
+      var ts = parseInt(localStorage.getItem(PAID_ADS_KEY), 10);
+      if (ts && (Date.now() - ts) < PAID_ADS_WINDOW_MS) return true;
+    } catch (e) {
+      return urlHasPaidAdsParam();
+    }
+    return false;
+  }
+
+  // --- Adjusted homepage -----------------------------------------------------
   function forceFont(root) {
     if (!root) return;
     var font = 'system-ui, sans-serif';
@@ -99,9 +224,8 @@
     });
   }
 
-  // Blocked visitors: cover the store with the full-screen adjusted homepage.
-  // The adjusted homepage is styled FIRST and the holding screen dropped LAST,
-  // so the store is never visible for even one frame in between.
+  // Styles the adjusted homepage FIRST and drops the holding screen LAST, so the
+  // store is never visible for a single frame in between.
   function showMaintenance() {
     var maintenance = document.getElementById('MaintenanceHome');
     var baseCss     = document.getElementById('baseCss');
@@ -122,34 +246,49 @@
     if (document.body) document.body.style.setProperty('overflow', 'hidden', 'important');
     if (baseCss) baseCss.disabled = true;
     forceFont(maintenance);
-    unhide(); // adjusted homepage is already covering — safe to drop the white screen
+    unhide();
   }
 
-  // Hold the page white while we resolve the country. Runs synchronously in
-  // <head>, before a single byte of <body> is parsed, so nothing can paint
-  // first. Skipped for returning visitors we already know are not blocked.
+  // --- Main flow (runs NOW, in <head>) ---------------------------------------
   if (window.isHomePage) {
-    var cachedCc = getCachedCountry();
-    if (!cachedCc || isBlockedCountry(cachedCc)) {
-      document.documentElement.className += ' ' + GEO_CLASS;
+    holdPage();
 
-      // Failsafe: never leave the page white if the lookup stalls. Only
-      // REVEALS — a blocked verdict arriving afterwards still applies.
-      setTimeout(function () {
-        if (SHOW_STORE_IF_UNKNOWN) { revealStore(); }
-        else { showMaintenance(); }
-      }, FAILSAFE_MS);
+    // Failsafe: only fires while the verdict is still outstanding. A blocked
+    // verdict merely waiting on the DOM will not trip it.
+    setTimeout(function () {
+      if (verdictIn) return;
+      if (SHOW_STORE_IF_UNKNOWN) { revealStore(); }
+      else { whenMaintenanceExists(showMaintenance); }
+    }, FAILSAFE_MS);
+
+    if (PAID_ADS_BYPASS && hasPaidAdsVisit()) {
+      adsBypass = true;
+      verdictIn = true;
+      revealStore();
+    } else {
+      // Start the lookup immediately — no DOM needed, no waiting for DCL.
+      detectCountryViaIP().then(function (cc) {
+        verdictIn = true;
+        if (adsBypass) return;
+        if (isBlockedCountry(cc)) {
+          whenMaintenanceExists(showMaintenance); // hold stays up until the element is there
+        } else {
+          revealStore();            // allowed: reveal at once, don't wait for DCL
+        }
+      }).catch(function () {
+        verdictIn = true;
+        revealStore(); // never leave the page white on an unexpected error
+      });
     }
   }
 
+  // --- DOM-dependent housekeeping --------------------------------------------
   document.addEventListener('DOMContentLoaded', function () {
     var maintenance = document.getElementById('MaintenanceHome');
 
-    // FIX (add-to-cart): UpCart's cart-drawer app block is rendered inside the
-    // maintenance snippet, i.e. inside #MaintenanceHome, which is display:none.
-    // That builds UpCart's drawer at 0x0 so it never shows and add-to-cart looks
-    // broken. Move any app block out of #MaintenanceHome to <body> so the drawer
-    // renders. Runs for every homepage visitor; observes for late-injected blocks.
+    // FIX (add-to-cart): UpCart's cart-drawer app block is rendered inside
+    // #MaintenanceHome, which is display:none, so its drawer builds at 0x0 and
+    // add-to-cart looks broken. Move any app block out to <body>.
     function relocateCartAppBlocks() {
       var mh = document.getElementById('MaintenanceHome');
       if (!mh) return;
@@ -165,9 +304,8 @@
       }
     } catch (e) {}
 
-    // Safety net: eagerly arm the homepage quick-add buttons in case any remain
-    // in Impulse's "--not-ready" state. Idempotent — only touches not-ready
-    // buttons — and harmless if the theme already armed them itself.
+    // Safety net: arm homepage quick-add buttons left in Impulse's
+    // "--not-ready" state. Idempotent and harmless if already armed.
     function armQuickShop() {
       if (!window.theme || typeof theme.preloadProductModal !== 'function') return;
       document.querySelectorAll('.grid-product__has-quick-shop').forEach(function (item) {
@@ -180,106 +318,6 @@
         }
       });
     }
-
-    // Paid Google Ads gate. Google Ads appends a click-id param on paid clicks:
-    //   gclid (Search/Shopping), gbraid / wbraid (iOS app/web), gad_source.
-    // Captured on ANY page and persisted so a later homepage visit bypasses IP.
-    var PAID_ADS_KEY = 'paidAdsVisit';
-    var PAID_ADS_WINDOW_MS = 30 * 60 * 1000; // 30-minute attribution window
-
-    function urlHasPaidAdsParam() {
-      return /[?&](gclid|gbraid|wbraid|gad_source)=/i.test(window.location.search);
-    }
-    function hasPaidAdsVisit() {
-      try {
-        if (urlHasPaidAdsParam()) {
-          localStorage.setItem(PAID_ADS_KEY, String(Date.now()));
-          return true;
-        }
-        var ts = parseInt(localStorage.getItem(PAID_ADS_KEY), 10);
-        if (ts && (Date.now() - ts) < PAID_ADS_WINDOW_MS) return true;
-      } catch (e) {
-        return urlHasPaidAdsParam();
-      }
-      return false;
-    }
-
-    // --- Geo detection: parallel provider race + 24h cache --------------------
-    // Keyless, CORS-friendly providers. ALL are queried at once and the first
-    // valid answer wins, so the verdict arrives as fast as the fastest provider.
-    var GEO_PROVIDERS = [
-      { url: 'https://api.country.is/',                 parse: function (d) { return d && d.country; } },
-      { url: 'https://get.geojs.io/v1/ip/country.json', parse: function (d) { return d && d.country; } },
-      { url: 'https://ipapi.co/json/',                  parse: function (d) { return d && d.country_code; } },
-      { url: 'https://ipwho.is/',                       parse: function (d) { return d && d.success !== false && d.country_code; } }
-    ];
-
-    function fetchWithTimeout(url, ms) {
-      var controller = new AbortController();
-      var timer = setTimeout(function () { controller.abort(); }, ms);
-      return fetch(url, { signal: controller.signal }).then(
-        function (r) { clearTimeout(timer); return r; },
-        function (e) { clearTimeout(timer); throw e; }
-      );
-    }
-
-    // Resolve with the first provider that returns a country code; resolve ''
-    // only once every provider has failed.
-    function lookupCountry() {
-      return new Promise(function (resolve) {
-        var pending = GEO_PROVIDERS.length;
-        var done = false;
-        function finish(cc) {
-          if (done) return;
-          done = true;
-          resolve(cc || '');
-        }
-        GEO_PROVIDERS.forEach(function (p) {
-          fetchWithTimeout(p.url, PROVIDER_TIMEOUT_MS)
-            .then(function (r) { return r.json(); })
-            .then(function (d) { return p.parse(d); })
-            .catch(function () { return null; })
-            .then(function (cc) {
-              if (cc) { finish(String(cc).toUpperCase()); return; }
-              pending--;
-              if (pending === 0) finish('');
-            });
-        });
-      });
-    }
-
-    function detectCountryViaIP() {
-      var cached = getCachedCountry();
-      if (cached) return Promise.resolve(cached);
-      return lookupCountry().then(function (cc) {
-        if (cc) setCachedCountry(cc); // only cache real results, never a failed ''
-        return cc;
-      });
-    }
-
-    // Capture paid-ads flag on every page load (including the landing page).
-    var paidAds = PAID_ADS_BYPASS && hasPaidAdsVisit();
-
-    // Non-homepage templates: normal store, nothing to do.
-    if (!window.isHomePage) { revealStore(); return; }
-
-    // Homepage + paid Google Ads click: keep the store and reveal.
-    if (paidAds) {
-      adsBypass = true; // hard stop — the gate must never close on a paid visitor
-      armQuickShop();
-      revealStore();
-      return;
-    }
-
-    // Otherwise the IP decides. Blocked countries get the adjusted homepage;
-    // everyone else keeps the fully-working store. A blocked verdict is applied
-    // even if the failsafe already revealed — the gate always wins.
-    detectCountryViaIP().then(function (cc) {
-      if (adsBypass) return;
-      if (isBlockedCountry(cc)) { showMaintenance(); }
-      else { armQuickShop(); revealStore(); }
-    }).catch(function () {
-      revealStore(); // never leave the page white because of an unexpected error
-    });
+    armQuickShop();
   });
 </script>
