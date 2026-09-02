@@ -4,30 +4,38 @@
   Visitors from the listed countries ('PK', 'EG', 'MA', 'IL', 'LB', 'YE', 'OM', 'IN', 'GB') see the ADJUSTED homepage (#MaintenanceHome). Every other country sees the store as usual. All non-homepage templates always render normally for everyone.
 
   Country is resolved by querying ALL keyless geo providers IN PARALLEL
-  (country.is, geojs, ipapi, ipwho.is); the first valid answer wins. Parallel,
-  not sequential — a slow or rate-limited provider can no longer hold up the
-  verdict, so the lookup typically finishes in a few hundred ms even over a VPN.
-  Result is cached per-visitor for 24h so we don't hammer any provider.
+  (country.is, geojs, ipapi, ipwho.is); the first valid answer wins, so a slow or
+  rate-limited provider can't hold up the verdict. Result is cached per-visitor
+  for 24h, so a returning blocked visitor is gated instantly with no lookup.
 
   FAIL OPEN: if ALL providers fail we cannot prove the visitor is in a blocked
   country, so the store shows as usual. Flip SHOW_STORE_IF_UNKNOWN to false to
   fail closed instead (unknown -> adjusted homepage). Do NOT trust Liquid's
   country: it defaults to the store's primary market and is unreliable.
 
-  ANTI-FLICKER (overlay, not visibility:hidden): the store still renders and
-  initializes exactly like a normal store — quick-add, add to cart, UpCart, etc.
-  all work — but an opaque white overlay is painted on top synchronously (before
-  first paint) so a blocked visitor never sees a flash of the store while the
-  async geo lookup runs. Because most traffic is now ALLOWED, the overlay is
-  skipped entirely for returning visitors whose cached country is not blocked.
+  ANTI-FLICKER — WHITE HOLDING SCREEN (CSS class, not a JS-inserted overlay):
+  the previous version appended a white <div> from JS while the page was still
+  in <head>. That div is subject to DOM-insertion timing and lost the race with
+  the parser, letting the real homepage paint for ~0.5s before it covered.
+  Instead we now add a class to <html> synchronously in <head> and let a <style>
+  block that is already parsed do the hiding. CSS is applied at first paint, so
+  there is no window in which the store can appear.
 
-  FAILSAFE: after FAILSAFE_MS with no verdict, the overlay is removed so the page
-  is never left blank. IMPORTANT — the failsafe only ever REVEALS; it never
-  cancels the gate. If a "blocked" verdict arrives after the failsafe already
-  revealed the store, the adjusted homepage is still applied. Blocking correctly
-  matters more than avoiding a rare late flicker, and the parallel lookup makes
-  that case very unlikely in the first place.
+  We use visibility, NOT display:none — the store still lays out and initializes
+  exactly like a normal store (quick-add, add to cart, UpCart all measure
+  correctly), it just isn't painted. Only the homepage is ever held; all other
+  templates render normally for everyone.
+
+  FAILSAFE: after FAILSAFE_MS with no verdict the page is revealed, so it is
+  never left white. The failsafe only ever REVEALS — it never cancels the gate,
+  so a blocked verdict arriving later still applies the adjusted homepage.
 {%- endcomment -%}
+<style>
+  /* White holding screen while the geo verdict is pending. Only active while
+     the .geo-checking class is on <html>, which JS adds and removes. */
+  html.geo-checking { background: #ffffff !important; }
+  html.geo-checking body { visibility: hidden !important; }
+</style>
 <script>
   window.isHomePage = {{ request.page_type | json }} === 'index';
 
@@ -44,10 +52,11 @@
   var GEO_KEY             = 'geoCountry';
   var GEO_TTL_MS          = 24 * 60 * 60 * 1000; // re-check at most once per day
   var PROVIDER_TIMEOUT_MS = 5000;                // generous — providers run in PARALLEL, so a slow one costs nothing
-  var FAILSAFE_MS         = 4000;                // max time the overlay may sit there with no verdict
+  var FAILSAFE_MS         = 4000;                // max time the page may be held white with no verdict
+  var GEO_CLASS           = 'geo-checking';
 
-  // Set only by the paid-ads bypass: a hard stop that prevents the gate from
-  // ever closing on a paid visitor. NOT used to cancel a late blocked verdict.
+  // Set only by the paid-ads bypass: a hard stop so the gate never closes on a
+  // paid visitor. NOT used to cancel a late blocked verdict.
   var adsBypass = false;
 
   // True once the store has been revealed, so we never double-reveal.
@@ -68,10 +77,17 @@
     return BLOCKED.indexOf(cc) !== -1;
   }
 
-  // Remove the anti-flicker overlay (reveals the store underneath).
-  function removeFlicker() {
-    var g = document.getElementById('geoFlicker');
-    if (g && g.parentNode) g.parentNode.removeChild(g);
+  // Drop the white holding screen.
+  function unhide() {
+    var de = document.documentElement;
+    if (de.classList) de.classList.remove(GEO_CLASS);
+    else de.className = de.className.replace(GEO_CLASS, '');
+  }
+
+  function revealStore() {
+    if (storeRevealed) return;
+    storeRevealed = true;
+    unhide();
   }
 
   function forceFont(root) {
@@ -84,15 +100,20 @@
   }
 
   // Blocked visitors: cover the store with the full-screen adjusted homepage.
-  // Top-level (not inside DOMContentLoaded) so the failsafe and the lookup —
-  // which can fire on either side of DOMContentLoaded — call the same function.
+  // The adjusted homepage is styled FIRST and the holding screen dropped LAST,
+  // so the store is never visible for even one frame in between.
   function showMaintenance() {
     var maintenance = document.getElementById('MaintenanceHome');
     var baseCss     = document.getElementById('baseCss');
     if (maintenance) {
       maintenance.style.setProperty('display', 'block', 'important');
+      maintenance.style.setProperty('visibility', 'visible', 'important');
       maintenance.style.setProperty('position', 'fixed', 'important');
       maintenance.style.setProperty('inset', '0', 'important');
+      maintenance.style.setProperty('top', '0', 'important');
+      maintenance.style.setProperty('left', '0', 'important');
+      maintenance.style.setProperty('right', '0', 'important');
+      maintenance.style.setProperty('bottom', '0', 'important');
       maintenance.style.setProperty('z-index', '2147483000', 'important');
       maintenance.style.setProperty('background', '#ffffff', 'important');
       maintenance.style.setProperty('overflow', 'auto', 'important');
@@ -101,36 +122,19 @@
     if (document.body) document.body.style.setProperty('overflow', 'hidden', 'important');
     if (baseCss) baseCss.disabled = true;
     forceFont(maintenance);
-    removeFlicker();
+    unhide(); // adjusted homepage is already covering — safe to drop the white screen
   }
 
-  function revealStore() {
-    if (storeRevealed) return;
-    storeRevealed = true;
-    removeFlicker();
-  }
-
-  // Anti-flicker overlay — painted before first paint, covers the store during
-  // the geo lookup. This is a COVER on top, NOT visibility:hidden, so the store
-  // renders/initializes normally underneath and nothing breaks. Skipped for
-  // returning visitors we already know are not blocked.
+  // Hold the page white while we resolve the country. Runs synchronously in
+  // <head>, before a single byte of <body> is parsed, so nothing can paint
+  // first. Skipped for returning visitors we already know are not blocked.
   if (window.isHomePage) {
     var cachedCc = getCachedCountry();
     if (!cachedCc || isBlockedCountry(cachedCc)) {
-      var geoFlicker = document.createElement('div');
-      geoFlicker.id = 'geoFlicker';
-      geoFlicker.setAttribute(
-        'style',
-        'position:fixed !important;inset:0 !important;top:0 !important;left:0 !important;' +
-        'right:0 !important;bottom:0 !important;width:100% !important;height:100% !important;' +
-        'z-index:2147483647 !important;background:#ffffff !important;opacity:1 !important;' +
-        'visibility:visible !important;'
-      );
-      (document.body || document.documentElement).appendChild(geoFlicker);
+      document.documentElement.className += ' ' + GEO_CLASS;
 
-      // Failsafe: never leave the page blank if the lookup stalls. This only
-      // REVEALS — it never cancels the gate, so a blocked verdict arriving
-      // afterwards still applies the adjusted homepage.
+      // Failsafe: never leave the page white if the lookup stalls. Only
+      // REVEALS — a blocked verdict arriving afterwards still applies.
       setTimeout(function () {
         if (SHOW_STORE_IF_UNKNOWN) { revealStore(); }
         else { showMaintenance(); }
@@ -202,8 +206,7 @@
 
     // --- Geo detection: parallel provider race + 24h cache --------------------
     // Keyless, CORS-friendly providers. ALL are queried at once and the first
-    // valid answer wins, so the verdict arrives as fast as the fastest provider
-    // instead of waiting out a chain of slow ones.
+    // valid answer wins, so the verdict arrives as fast as the fastest provider.
     var GEO_PROVIDERS = [
       { url: 'https://api.country.is/',                 parse: function (d) { return d && d.country; } },
       { url: 'https://get.geojs.io/v1/ip/country.json', parse: function (d) { return d && d.country; } },
@@ -258,7 +261,7 @@
     var paidAds = PAID_ADS_BYPASS && hasPaidAdsVisit();
 
     // Non-homepage templates: normal store, nothing to do.
-    if (!window.isHomePage) { return; }
+    if (!window.isHomePage) { revealStore(); return; }
 
     // Homepage + paid Google Ads click: keep the store and reveal.
     if (paidAds) {
@@ -270,19 +273,13 @@
 
     // Otherwise the IP decides. Blocked countries get the adjusted homepage;
     // everyone else keeps the fully-working store. A blocked verdict is applied
-    // even if the failsafe already revealed the store — the gate always wins.
+    // even if the failsafe already revealed — the gate always wins.
     detectCountryViaIP().then(function (cc) {
       if (adsBypass) return;
       if (isBlockedCountry(cc)) { showMaintenance(); }
       else { armQuickShop(); revealStore(); }
+    }).catch(function () {
+      revealStore(); // never leave the page white because of an unexpected error
     });
-  });
-
-  console.log({
-    snippetLoaded: typeof window.isHomePage !== 'undefined',
-    isHomePage: window.isHomePage,
-    maintenanceEl: !!document.getElementById('MaintenanceHome'),
-    cachedGeo: localStorage.getItem('geoCountry'),
-    paidAds: localStorage.getItem('paidAdsVisit')
   });
 </script>
