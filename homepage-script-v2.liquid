@@ -1,0 +1,374 @@
+{%- comment -%}
+  Geo gate — BLOCKLIST mode. Paste this in <head>, replacing the existing gate script.
+
+  Visitors from BLOCKED countries see #MaintenanceHome. Everyone else sees the store.
+
+  FIXES vs. previous version:
+   1. showMaintenance() no longer unhides when #MaintenanceHome is missing.
+   2. whenMaintenanceExists() waits for the element instead of firing blindly at DCL,
+      and falls back to an inline notice rather than revealing the store.
+   3. The geo .catch() honours SHOW_STORE_IF_UNKNOWN instead of always failing open.
+   4. relocateCartAppBlocks() is gated on the verdict, so it can no longer empty the
+      maintenance container on a blocked visit.
+   5. baseCss is found by href when the id is absent.
+   6. Paid-ads bypass is debuggable and its persistence is configurable.
+
+  TESTING: append ?geotest=PK to force a country, ?geotest=off to clear the override,
+  and set GEO_DEBUG = true to log which path fired.
+{%- endcomment -%}
+<script>
+  window.isHomePage = {{ request.page_type | json }} === 'index';
+
+  // --- Config ---------------------------------------------------------------
+  var BLOCKED = ['PK', 'EG', 'MA', 'IL', 'LB', 'YE', 'OM', 'IN', 'GB'];
+
+  // Country unknown (all providers failed) -> true shows the normal store.
+  var SHOW_STORE_IF_UNKNOWN = false;
+
+  // Paid Google Ads clicks always see the store, even from a blocked country.
+  var PAID_ADS_BYPASS = true;
+
+  // false = the bypass applies ONLY while a click-id is in the current URL.
+  // true  = it persists in localStorage for PAID_ADS_WINDOW_MS across the site.
+  var PAID_ADS_PERSIST = true;
+
+  var USE_GEO_CACHE = false;
+
+  var GEO_DEBUG           = false;               // log the verdict path to the console
+  var GEO_KEY             = 'geoCountry';
+  var GEO_TTL_MS          = 24 * 60 * 60 * 1000;
+  var PROVIDER_TIMEOUT_MS = 5000;                // providers run in PARALLEL
+  var FAILSAFE_MS         = 6000;                // max white time while the verdict is outstanding
+  var ELEMENT_WAIT_MS     = 8000;                // max wait for #MaintenanceHome after a blocked verdict
+  var HOLD_STYLE_ID       = 'geoHoldStyle';
+  var FALLBACK_ID         = 'geoFallbackNotice';
+
+  // Shown only if the verdict is BLOCKED but #MaintenanceHome never appears.
+  var FALLBACK_HTML =
+    '<h1 style="font:500 20px system-ui,sans-serif;margin:0 0 8px">We&rsquo;ll be back soon</h1>' +
+    '<p style="font:400 15px system-ui,sans-serif;margin:0;color:#555">' +
+      'This store is not available in your region right now.' +
+    '</p>';
+
+  var adsBypass      = false;
+  var storeRevealed  = false;
+  var verdictIn      = false;
+  var blockedVerdict = false; // true once we know the visitor must NOT see the store
+
+  function log() {
+    if (!GEO_DEBUG) return;
+    try { console.log.apply(console, ['[geo]'].concat([].slice.call(arguments))); } catch (e) {}
+  }
+
+  // --- White holding screen --------------------------------------------------
+  function holdPage() {
+    if (document.getElementById(HOLD_STYLE_ID)) return;
+    var s = document.createElement('style');
+    s.id = HOLD_STYLE_ID;
+    s.textContent =
+      'html::before{' +
+        'content:"" !important;' +
+        'position:fixed !important;' +
+        'top:0 !important;left:0 !important;right:0 !important;bottom:0 !important;' +
+        'width:100% !important;height:100% !important;' +
+        'background:#ffffff !important;' +
+        'z-index:2147483647 !important;' +
+        'pointer-events:auto !important;' +
+      '}';
+    (document.head || document.documentElement).appendChild(s);
+  }
+
+  function unhide() {
+    var s = document.getElementById(HOLD_STYLE_ID);
+    if (s && s.parentNode) s.parentNode.removeChild(s);
+  }
+
+  function revealStore() {
+    if (storeRevealed) return;
+    if (blockedVerdict) { log('revealStore suppressed: blocked'); return; } // hard stop
+    storeRevealed = true;
+    log('revealStore');
+    unhide();
+  }
+
+  // Last resort: blocked, but the maintenance markup never showed up. Paint a notice
+  // ON TOP of the hold so we neither leave a blank page nor expose the store.
+  function renderFallbackNotice() {
+    if (document.getElementById(FALLBACK_ID)) return;
+    log('fallback notice (MaintenanceHome missing)');
+    var d = document.createElement('div');
+    d.id = FALLBACK_ID;
+    d.setAttribute('style',
+      'position:fixed;inset:0;z-index:2147483647;background:#fff;' +
+      'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
+      'text-align:center;padding:24px;');
+    d.innerHTML = FALLBACK_HTML;
+    (document.body || document.documentElement).appendChild(d);
+    document.documentElement.style.setProperty('overflow', 'hidden', 'important');
+  }
+
+  function onReady(fn) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', fn);
+    } else {
+      fn();
+    }
+  }
+
+  // Run fn as soon as #MaintenanceHome exists. If it never appears within
+  // ELEMENT_WAIT_MS, run onTimeout instead. Critically, this no longer gives up at
+  // DOMContentLoaded — the old onReady(go) backstop fired showMaintenance() with no
+  // element, which unhid the store on a blocked visit.
+  function whenMaintenanceExists(fn, onTimeout) {
+    if (document.getElementById('MaintenanceHome')) { fn(); return; }
+    var mo = null, timer = null, done = false;
+    function stop() {
+      if (mo) { try { mo.disconnect(); } catch (e) {} }
+      if (timer) clearTimeout(timer);
+    }
+    function go() {
+      if (done) return;
+      done = true;
+      stop();
+      fn();
+    }
+    try {
+      mo = new MutationObserver(function () {
+        if (document.getElementById('MaintenanceHome')) go();
+      });
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {}
+    timer = setTimeout(function () {
+      if (done) return;
+      done = true;
+      stop();
+      (onTimeout || fn)();
+    }, ELEMENT_WAIT_MS);
+  }
+
+  // --- Country helpers -------------------------------------------------------
+  function testOverride() {
+    var m = /[?&]geotest=([a-z]{2}|off)/i.exec(window.location.search);
+    if (!m) { try { return sessionStorage.getItem('geoTest') || null; } catch (e) { return null; } }
+    var v = m[1].toUpperCase();
+    try {
+      if (v === 'OFF') { sessionStorage.removeItem('geoTest'); return null; }
+      sessionStorage.setItem('geoTest', v);
+    } catch (e) {}
+    return v === 'OFF' ? null : v;
+  }
+  function getCachedCountry() {
+    if (!USE_GEO_CACHE) return null;
+    try {
+      var o = JSON.parse(localStorage.getItem(GEO_KEY));
+      if (o && o.cc && (Date.now() - o.ts) < GEO_TTL_MS) return o.cc;
+    } catch (e) {}
+    return null;
+  }
+  function setCachedCountry(cc) {
+    if (!USE_GEO_CACHE) return;
+    try { localStorage.setItem(GEO_KEY, JSON.stringify({ cc: cc, ts: Date.now() })); } catch (e) {}
+  }
+  function isBlockedCountry(cc) {
+    if (!cc) return !SHOW_STORE_IF_UNKNOWN;
+    return BLOCKED.indexOf(cc) !== -1;
+  }
+
+  // --- Geo detection: parallel provider race ---------------------------------
+  var GEO_PROVIDERS = [
+    { url: 'https://api.country.is/',                 parse: function (d) { return d && d.country; } },
+    { url: 'https://get.geojs.io/v1/ip/country.json', parse: function (d) { return d && d.country; } },
+    { url: 'https://ipapi.co/json/',                  parse: function (d) { return d && d.country_code; } },
+    { url: 'https://ipwho.is/',                       parse: function (d) { return d && d.success !== false && d.country_code; } }
+  ];
+
+  function fetchWithTimeout(url, ms) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, ms);
+    return fetch(url, { signal: controller.signal }).then(
+      function (r) { clearTimeout(timer); return r; },
+      function (e) { clearTimeout(timer); throw e; }
+    );
+  }
+
+  function lookupCountry() {
+    return new Promise(function (resolve) {
+      var pending = GEO_PROVIDERS.length;
+      var done = false;
+      function finish(cc) {
+        if (done) return;
+        done = true;
+        resolve(cc || '');
+      }
+      GEO_PROVIDERS.forEach(function (p) {
+        fetchWithTimeout(p.url, PROVIDER_TIMEOUT_MS)
+          .then(function (r) { return r.json(); })
+          .then(function (d) { return p.parse(d); })
+          .catch(function () { log('provider failed:', p.url); return null; })
+          .then(function (cc) {
+            if (cc) { log('provider won:', p.url, cc); finish(String(cc).toUpperCase()); return; }
+            pending--;
+            if (pending === 0) { log('all providers failed'); finish(''); }
+          });
+      });
+    });
+  }
+
+  function detectCountryViaIP() {
+    var forced = testOverride();
+    if (forced) { log('geotest override:', forced); return Promise.resolve(forced); }
+    var cached = getCachedCountry();
+    if (cached) { log('cache hit:', cached); return Promise.resolve(cached); }
+    return lookupCountry().then(function (cc) {
+      if (cc) setCachedCountry(cc);
+      return cc;
+    });
+  }
+
+  // --- Paid Google Ads bypass ------------------------------------------------
+  var PAID_ADS_KEY       = 'paidAdsVisit';
+  var PAID_ADS_WINDOW_MS = 30 * 60 * 1000;
+
+  function urlHasPaidAdsParam() {
+    return /[?&](gclid|gbraid|wbraid|gad_source)=/i.test(window.location.search);
+  }
+  function hasPaidAdsVisit() {
+    if (urlHasPaidAdsParam()) {
+      if (PAID_ADS_PERSIST) {
+        try { localStorage.setItem(PAID_ADS_KEY, String(Date.now())); } catch (e) {}
+      }
+      return true;
+    }
+    if (!PAID_ADS_PERSIST) return false;
+    try {
+      var ts = parseInt(localStorage.getItem(PAID_ADS_KEY), 10);
+      if (ts && (Date.now() - ts) < PAID_ADS_WINDOW_MS) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // --- Adjusted homepage -----------------------------------------------------
+  function forceFont(root) {
+    if (!root) return;
+    var font = 'system-ui, sans-serif';
+    root.style.setProperty('font-family', font, 'important');
+    root.querySelectorAll('*').forEach(function (node) {
+      node.style.setProperty('font-family', font, 'important');
+    });
+  }
+
+  // base.css has no id when emitted by stylesheet_tag, so fall back to matching href.
+  function findBaseCss() {
+    var el = document.getElementById('baseCss');
+    if (el) return el;
+    var links = document.querySelectorAll('link[rel="stylesheet"][href*="base.css"]');
+    return links.length ? links[0] : null;
+  }
+
+  function showMaintenance() {
+    var maintenance = document.getElementById('MaintenanceHome');
+
+    // Do NOT unhide when the element is absent — that was the fail-open bug.
+    if (!maintenance) { renderFallbackNotice(); return; }
+
+    maintenance.style.setProperty('display', 'block', 'important');
+    maintenance.style.setProperty('visibility', 'visible', 'important');
+    maintenance.style.setProperty('position', 'fixed', 'important');
+    maintenance.style.setProperty('inset', '0', 'important');
+    maintenance.style.setProperty('top', '0', 'important');
+    maintenance.style.setProperty('left', '0', 'important');
+    maintenance.style.setProperty('right', '0', 'important');
+    maintenance.style.setProperty('bottom', '0', 'important');
+    maintenance.style.setProperty('z-index', '2147483000', 'important');
+    maintenance.style.setProperty('background', '#ffffff', 'important');
+    maintenance.style.setProperty('overflow', 'auto', 'important');
+
+    document.documentElement.style.setProperty('overflow', 'hidden', 'important');
+    if (document.body) document.body.style.setProperty('overflow', 'hidden', 'important');
+
+    var baseCss = findBaseCss();
+    if (baseCss) baseCss.disabled = true;
+
+    try { forceFont(maintenance); } catch (e) { log('forceFont threw', e); }
+
+    log('maintenance shown');
+    unhide();
+  }
+
+  function applyBlock() {
+    blockedVerdict = true;
+    whenMaintenanceExists(showMaintenance, renderFallbackNotice);
+  }
+
+  // --- Main flow (runs NOW, in <head>) ---------------------------------------
+  if (window.isHomePage) {
+    holdPage();
+
+    setTimeout(function () {
+      if (verdictIn) return;
+      log('failsafe fired, verdict still outstanding');
+      if (SHOW_STORE_IF_UNKNOWN) { revealStore(); }
+      else { applyBlock(); }
+    }, FAILSAFE_MS);
+
+    if (PAID_ADS_BYPASS && hasPaidAdsVisit()) {
+      adsBypass = true;
+      verdictIn = true;
+      log('paid-ads bypass');
+      revealStore();
+    } else {
+      detectCountryViaIP().then(function (cc) {
+        verdictIn = true;
+        if (adsBypass) return;
+        log('verdict:', cc || '(unknown)', 'blocked:', isBlockedCountry(cc));
+        if (isBlockedCountry(cc)) { applyBlock(); }
+        else { revealStore(); }
+      }).catch(function (e) {
+        // Honour the flag here too — this used to reveal the store unconditionally.
+        verdictIn = true;
+        log('lookup threw', e);
+        if (SHOW_STORE_IF_UNKNOWN) { revealStore(); }
+        else { applyBlock(); }
+      });
+    }
+  }
+
+  // --- DOM-dependent housekeeping --------------------------------------------
+  document.addEventListener('DOMContentLoaded', function () {
+    // Moves UpCart / app blocks out of the hidden container so their drawers size
+    // correctly. Skipped on a blocked visit, where it would strip the maintenance
+    // markup out of #MaintenanceHome and leave it empty.
+    function relocateCartAppBlocks() {
+      if (blockedVerdict) return;
+      var mh = document.getElementById('MaintenanceHome');
+      if (!mh || !document.body) return;
+      var blocks = mh.querySelectorAll('.shopify-app-block, [id^="shopify-block"]');
+      for (var i = 0; i < blocks.length; i++) { document.body.appendChild(blocks[i]); }
+    }
+    relocateCartAppBlocks();
+    setTimeout(relocateCartAppBlocks, 500);
+    setTimeout(relocateCartAppBlocks, 1500);
+    try {
+      var mh = document.getElementById('MaintenanceHome');
+      if (mh && window.MutationObserver) {
+        new MutationObserver(relocateCartAppBlocks).observe(mh, { childList: true });
+      }
+    } catch (e) {}
+
+    // Safety net: arm homepage quick-add buttons left in Impulse's "--not-ready" state.
+    function armQuickShop() {
+      if (blockedVerdict) return;
+      if (!window.theme || typeof theme.preloadProductModal !== 'function') return;
+      document.querySelectorAll('.grid-product__has-quick-shop').forEach(function (item) {
+        var btn = item.querySelector('.quick-product__btn--not-ready');
+        if (!btn) return;
+        var handle = item.getAttribute('data-product-handle');
+        var id     = item.getAttribute('data-product-id');
+        if (handle && id) {
+          try { theme.preloadProductModal(handle, id, btn); } catch (e) {}
+        }
+      });
+    }
+    armQuickShop();
+  });
+</script>
