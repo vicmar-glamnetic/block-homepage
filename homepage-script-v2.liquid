@@ -12,6 +12,8 @@
       maintenance container on a blocked visit.
    5. baseCss is found by href when the id is absent.
    6. Paid-ads bypass is debuggable and its persistence is configurable.
+   7. App-injected overlays (email popups, chat widgets, cart drawers) are suppressed
+      while the gate is closed, instead of painting over the maintenance screen.
 
   TESTING: append ?geotest=PK to force a country, ?geotest=off to clear the override,
   and set GEO_DEBUG = true to log which path fired.
@@ -42,6 +44,19 @@
   var ELEMENT_WAIT_MS     = 8000;                // max wait for #MaintenanceHome after a blocked verdict
   var HOLD_STYLE_ID       = 'geoHoldStyle';
   var FALLBACK_ID         = 'geoFallbackNotice';
+
+  // Anything an app injects that must not paint over the maintenance screen.
+  // Popups, chat widgets and cart drawers mount at <body> level with a max z-index;
+  // app blocks mount INSIDE #MaintenanceHome and render as part of the page.
+  // Add data-geo-keep="true" to an element you deliberately want kept visible.
+  var APP_SELECTOR = [
+    '.shopify-app-block', '[id^="shopify-block"]',
+    '.klaviyo-form', '[class*="kl-private"]',
+    '#PrivyWidget', '[id^="privy-"]',
+    'shopify-email-capture',
+    '.needsclick[id^="attentive"]',
+    '#upcart-cart-drawer'
+  ].join(',');
 
   // Shown only if the verdict is BLOCKED but #MaintenanceHome never appears.
   var FALLBACK_HTML =
@@ -279,7 +294,7 @@
     maintenance.style.setProperty('left', '0', 'important');
     maintenance.style.setProperty('right', '0', 'important');
     maintenance.style.setProperty('bottom', '0', 'important');
-    maintenance.style.setProperty('z-index', '2147483000', 'important');
+    maintenance.style.setProperty('z-index', '2147483646', 'important');
     maintenance.style.setProperty('background', '#ffffff', 'important');
     maintenance.style.setProperty('overflow', 'auto', 'important');
 
@@ -295,9 +310,37 @@
     unhide();
   }
 
+  // --- App overlay suppression (blocked visits only) --------------------------
+  // Email-capture popups fire on a timer, so they appear seconds AFTER the verdict
+  // and paint over the overlay. A MutationObserver catches them whenever they mount;
+  // the timed passes cover apps that unhide an element already in the DOM.
+  function suppressApps() {
+    if (!blockedVerdict) return;
+    var mh = document.getElementById('MaintenanceHome');
+    var nodes;
+    try { nodes = document.querySelectorAll(APP_SELECTOR); } catch (e) { return; }
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.getAttribute('data-geo-keep') === 'true' && mh && mh.contains(el)) continue;
+      if (el.getAttribute('data-geo-hidden') === 'true') continue;
+      el.setAttribute('data-geo-hidden', 'true');
+      el.style.setProperty('display', 'none', 'important');
+    }
+  }
+
+  function watchApps() {
+    suppressApps();
+    try {
+      new MutationObserver(suppressApps)
+        .observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {}
+    [500, 1500, 3000, 6000, 10000].forEach(function (ms) { setTimeout(suppressApps, ms); });
+  }
+
   function applyBlock() {
     blockedVerdict = true;
     whenMaintenanceExists(showMaintenance, renderFallbackNotice);
+    onReady(watchApps);
   }
 
   // --- Main flow (runs NOW, in <head>) ---------------------------------------
